@@ -15,8 +15,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/haonox/Arc-CLI/internal/arc"
 	"github.com/charmbracelet/x/term"
+	"github.com/haonox/Arc-CLI/internal/arc"
 )
 
 type options struct {
