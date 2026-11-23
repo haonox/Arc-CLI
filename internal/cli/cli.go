@@ -1,4 +1,5 @@
-// Package cli assembles the runtime and adapts it to terminal and JSONL clients.
+// Package cli parses Arc's commands, assembles the runtime, and presents its
+// events as terminal text or JSONL.
 package cli
 
 import (
@@ -19,6 +20,8 @@ import (
 	"github.com/haonox/Arc-CLI/internal/arc"
 )
 
+// options holds command-line values before user and project configuration is
+// resolved. The supplied fields preserve whether an option was present.
 type options struct {
 	mode, model, baseURL, profile, cwd                     string
 	session, resume, tools, policy                         string
@@ -31,6 +34,8 @@ type options struct {
 	allowToolEnv, denyToolEnv                              []string
 }
 
+// parse registers and reads flags into o. It returns the remaining prompt
+// arguments and writes parser help or diagnostics to output.
 func (o *options) parse(args []string, output io.Writer) ([]string, error) {
 	flags := flag.NewFlagSet("arc", flag.ContinueOnError)
 	flags.SetOutput(output)
@@ -38,6 +43,7 @@ func (o *options) parse(args []string, output io.Writer) ([]string, error) {
 		fmt.Fprintln(output, "Usage: arc [options] [prompt ...]\n       arc sessions [--cwd DIR] {list,rename,archive,restore} ...\n\nArc CLI: terminal-native agent runtime")
 		flags.PrintDefaults()
 	}
+	// Both spellings write to the same field.
 	flags.BoolVar(&o.printMode, "p", false, "run once and exit")
 	flags.BoolVar(&o.printMode, "print", false, "run once and exit")
 	flags.StringVar(&o.mode, "mode", "text", "output mode: text or json")
@@ -77,6 +83,8 @@ func (o *options) parse(args []string, output io.Writer) ([]string, error) {
 	if err := parseInterspersed(flags, args); err != nil {
 		return nil, err
 	}
+	// Visit reports flags that were set during parsing, including explicit
+	// values equal to their defaults.
 	flags.Visit(func(f *flag.Flag) {
 		switch f.Name {
 		case "tools":
@@ -90,7 +98,8 @@ func (o *options) parse(args []string, output io.Writer) ([]string, error) {
 	return flags.Args(), nil
 }
 
-// Keep prompts after options for flag.FlagSet, including prompts given before a flag.
+// parseInterspersed moves options before prompt arguments so flag.FlagSet
+// can parse flags appearing anywhere before the explicit -- separator.
 func parseInterspersed(set *flag.FlagSet, args []string) error {
 	var options, positionals []string
 	for i := 0; i < len(args); i++ {
@@ -109,6 +118,8 @@ func parseInterspersed(set *flag.FlagSet, args []string) error {
 		if f == nil || hasValue {
 			continue
 		}
+		// Boolean flags can stand alone. Keep the following argument for
+		// non-boolean flags that take their values separately.
 		isBool, ok := f.Value.(interface{ IsBoolFlag() bool })
 		if ok && isBool.IsBoolFlag() {
 			continue
@@ -121,6 +132,8 @@ func parseInterspersed(set *flag.FlagSet, args []string) error {
 	return set.Parse(append(append(options, "--"), positionals...))
 }
 
+// validate checks mutually exclusive options, supported values, and limits
+// after the flag parser has converted the input types.
 func (o options) validate() error {
 	selected := 0
 	for _, chosen := range []bool{o.session != "", o.resume != "", o.noSession, o.continueSession} {
@@ -140,6 +153,7 @@ func (o options) validate() error {
 	if !slices.Contains([]string{"", arc.Confirm, arc.Autonomous, arc.Restricted}, o.policy) {
 		return errors.New("--policy must be confirm, autonomous or restricted")
 	}
+	// The float timeout must fit in a positive time.Duration in nanoseconds.
 	if o.maxTurns < 1 || math.IsNaN(o.timeout) || o.timeout*float64(time.Second) < 1 || o.timeout >= float64(math.MaxInt64)/float64(time.Second) {
 		return errors.New("limits must be positive and within range")
 	}
@@ -152,11 +166,16 @@ func (o options) validate() error {
 	return nil
 }
 
+// isTerminal reports whether a stream exposes an OS file descriptor
+// connected to a terminal.
 func isTerminal(stream any) bool {
 	file, ok := stream.(interface{ Fd() uintptr })
 	return ok && term.IsTerminal(file.Fd())
 }
 
+// Run executes Arc with the supplied arguments and streams. Args excludes
+// the executable name. It returns 0 for success, 1 for a failed task,
+// 2 for a CLI or setup error, and 130 for an interrupted run.
 func Run(ctx context.Context, args []string, in io.Reader, out, stderr io.Writer) int {
 	if len(args) > 0 && args[0] == "sessions" {
 		code, err := runCatalog(args[1:], out)
@@ -166,6 +185,8 @@ func Run(ctx context.Context, args []string, in io.Reader, out, stderr io.Writer
 		return code
 	}
 	var opts options
+	// Buffer parser output so the CLI can send requested help to stdout and
+	// render malformed invocations through its usual error path.
 	var usage strings.Builder
 	promptArgs, err := opts.parse(args, &usage)
 	if errors.Is(err, flag.ErrHelp) {
@@ -190,6 +211,7 @@ func Run(ctx context.Context, args []string, in io.Reader, out, stderr io.Writer
 	return code
 }
 
+// writeAppError presents a startup error in the requested output format.
 func writeAppError(mode string, err error, out, stderr io.Writer) {
 	if mode == "json" {
 		_ = json.NewEncoder(out).Encode(arc.Event{Type: "error", Data: arc.Object{"message": err.Error()}})
@@ -198,6 +220,8 @@ func writeAppError(mode string, err error, out, stderr io.Writer) {
 	}
 }
 
+// openSession resolves the requested resume target. A nil session with
+// a nonempty path tells launch to create a new file at that path.
 func openSession(opts options, cwd string) (*arc.Session, string, error) {
 	catalog := arc.NewCatalog(cwd, os.Getenv)
 	path := opts.session
@@ -214,12 +238,16 @@ func openSession(opts options, cwd string) (*arc.Session, string, error) {
 		return nil, path, err
 	}
 	session, err := arc.OpenSession(path)
+	// Only an explicit path can name a new file. Resume requests refer to
+	// existing catalog entries.
 	if errors.Is(err, os.ErrNotExist) && opts.session != "" {
 		return nil, path, nil
 	}
 	return session, path, err
 }
 
+// launch selects the interaction mode, resolves the workspace, and assembles
+// an agent with its provider, tools, and session.
 func launch(ctx context.Context, o options, prompt string, in io.Reader, out, stderr io.Writer) (int, error) {
 	inputTTY, outputTTY := isTerminal(in), isTerminal(out)
 	oneShot := o.printMode || o.mode == "json" || !inputTTY || !outputTTY
@@ -229,6 +257,7 @@ func launch(ctx context.Context, o options, prompt string, in io.Reader, out, st
 			return 2, err
 		}
 		prompt = strings.TrimSpace(prompt)
+		// Keep the command-line prompt ahead of the piped material.
 		if piped := strings.TrimSpace(string(text)); piped != "" {
 			if prompt != "" {
 				prompt += "\n\n"
@@ -249,6 +278,8 @@ func launch(ctx context.Context, o options, prompt string, in io.Reader, out, st
 	}
 	if session != nil {
 		defer session.Close()
+		// Resuming a session preserves its original workspace and therefore
+		// the scope of file tools and project configuration.
 		saved, err := arc.Workspace(session.Info().CWD)
 		if err != nil {
 			return 2, errors.New("saved session cwd no longer exists")
@@ -284,6 +315,8 @@ func launch(ctx context.Context, o options, prompt string, in io.Reader, out, st
 		return 2, err
 	}
 	catalog := arc.NewCatalog(cwd, os.Getenv)
+	// Create persistent state only after provider, tool, and instruction
+	// configuration has passed validation.
 	if session == nil {
 		if !o.noSession && path == "" {
 			path = catalog.NewPath()
@@ -324,6 +357,9 @@ func launch(ctx context.Context, o options, prompt string, in io.Reader, out, st
 	return runTerminal(ctx, runner, provider, in, out, prompt, history, color, color && !o.noMarkdown)
 }
 
+// runOnce executes one task without a terminal UI. Text mode keeps stdout
+// for the model answer and stderr for diagnostics. JSON mode streams events
+// on stdout.
 func runOnce(ctx context.Context, agent *arc.Agent, prompt, mode string, out, stderr io.Writer) int {
 	encoder := json.NewEncoder(out)
 	encoder.SetEscapeHTML(false)
@@ -356,6 +392,7 @@ func runOnce(ctx context.Context, agent *arc.Agent, prompt, mode string, out, st
 		return nil
 	})
 	if mode == "text" && textWritten && !endedLine {
+		// Leave the shell prompt on a fresh line after a partial final line.
 		fmt.Fprintln(out)
 	}
 	if ctx.Err() != nil {
@@ -367,6 +404,8 @@ func runOnce(ctx context.Context, agent *arc.Agent, prompt, mode string, out, st
 	return 1
 }
 
+// runCatalog implements local session management without starting the model
+// runtime. Args contains only the subcommand and its options.
 func runCatalog(args []string, out io.Writer) (int, error) {
 	flags := flag.NewFlagSet("arc sessions", flag.ContinueOnError)
 	var output strings.Builder

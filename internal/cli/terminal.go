@@ -15,10 +15,10 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/haonox/Arc-CLI/internal/arc"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/x/ansi"
+	"github.com/haonox/Arc-CLI/internal/arc"
 )
 
 const help = `Enter a task at ›. While Arc is running, text entered at ↳ steers the next model turn.
@@ -46,24 +46,31 @@ var commands = []string{
 	"/model", "/new", "/quit", "/rename", "/session", "/status", "/steer", "/tools", "/tree",
 }
 
+// approvalRequest carries a proposal from the agent worker and a channel
+// for the UI's decision.
 type approvalRequest struct {
 	request arc.Authorization
 	answer  chan bool
 }
 
+// taskFinished reports that a worker has returned from a run or compaction.
 type taskFinished struct {
 	status     string
 	err        error
 	compaction bool
 }
 
+// spinnerTick identifies the task that scheduled the animation update.
 type spinnerTick struct{ task int }
 
+// toolSnapshot retains the last completed tool's call and result for display.
 type toolSnapshot struct {
 	call  arc.ToolCall
 	event arc.Event
 }
 
+// terminal is the Bubble Tea model. The event loop owns its mutable state.
+// An agent worker sends events and receives approval decisions over channels.
 type terminal struct {
 	programCtx    context.Context
 	agent         *arc.Agent
@@ -71,14 +78,14 @@ type terminal struct {
 	input         textinput.Model
 	historyPath   string
 	history       []string
-	historyIndex  int
+	historyIndex  int // Negative until a prefix search starts.
 	historyPrefix string
 	initial       string
 
 	width             int
 	color, markdown   bool
 	inFence           bool
-	partial           string
+	partial           string // Answer text after the last committed newline.
 	activity          string
 	activitySince     time.Time
 	frame, turn, task int
@@ -89,11 +96,13 @@ type terminal struct {
 	total             arc.Usage
 
 	events         chan tea.Msg
-	workerDone     chan struct{}
+	workerDone     chan struct{} // Closed when the current worker exits.
 	cancelTask     context.CancelFunc
 	busy, quitting bool
 }
 
+// runTerminal runs the interactive UI and waits for an active worker to
+// finish before the caller releases its session and provider.
 func runTerminal(ctx context.Context, agent *arc.Agent, provider *arc.OpenAIProvider, in io.Reader, out io.Writer,
 	prompt, history string, color, markdown bool) (int, error) {
 	ctx, cancel := context.WithCancel(ctx)
@@ -105,6 +114,7 @@ func runTerminal(ctx context.Context, agent *arc.Agent, provider *arc.OpenAIProv
 		cancel()
 		return 2, err
 	}
+	// The process entry point already owns OS signal handling.
 	program := tea.NewProgram(ui, tea.WithInput(in), tea.WithOutput(out), tea.WithContext(ctx), tea.WithoutSignalHandler())
 	_, err := program.Run()
 	cancel()
@@ -123,6 +133,7 @@ func runTerminal(ctx context.Context, agent *arc.Agent, provider *arc.OpenAIProv
 	return 0, nil
 }
 
+// Init focuses input, prints the banner, and starts an optional initial prompt.
 func (t *terminal) Init() tea.Cmd {
 	focus := t.input.Focus()
 	banner := t.paint("ARC "+arc.Version+" · "+safeText(t.provider.Model())+" · "+safeText(t.agent.Environment.CWD), "36")
@@ -133,6 +144,8 @@ func (t *terminal) Init() tea.Cmd {
 	return tea.Sequence(tea.Println(banner+"\n"+tip+"\n"), focus)
 }
 
+// waitEvent turns one worker message into a Bubble Tea command so waiting
+// for it happens outside the UI update loop.
 func waitEvent(events <-chan tea.Msg) tea.Cmd {
 	return func() tea.Msg {
 		return <-events
@@ -143,6 +156,8 @@ func tick(task int) tea.Cmd {
 	return tea.Tick(100*time.Millisecond, func(time.Time) tea.Msg { return spinnerTick{task: task} })
 }
 
+// start launches a task worker with a separate cancellation scope. A positive
+// keep value selects manual compaction.
 func (t *terminal) start(prompt string, keep int) tea.Cmd {
 	ctx, cancel := context.WithCancel(t.programCtx)
 	t.cancelTask, t.busy = cancel, true
@@ -156,6 +171,8 @@ func (t *terminal) start(prompt string, keep int) tea.Cmd {
 	t.events, t.workerDone = make(chan tea.Msg, 32), make(chan struct{})
 	events, done := t.events, t.workerDone
 	send := func(message tea.Msg) error {
+		// Use the program context so canceling a task can still deliver its
+		// final events while the UI is running.
 		select {
 		case events <- message:
 			return nil
@@ -164,6 +181,8 @@ func (t *terminal) start(prompt string, keep int) tea.Cmd {
 		}
 	}
 	t.agent.Approve = func(callCtx context.Context, request arc.Authorization) (bool, error) {
+		// Buffer the decision so the UI stays responsive if the call is
+		// canceled just as the user answers.
 		answer := make(chan bool, 1)
 		if err := send(approvalRequest{request, answer}); err != nil {
 			return false, err
@@ -190,6 +209,8 @@ func (t *terminal) start(prompt string, keep int) tea.Cmd {
 	return tea.Batch(waitEvent(events), tick(t.task))
 }
 
+// Update handles input and worker messages on the UI loop. It returns
+// commands for waiting on the worker or writing scrollback lines.
 func (t *terminal) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
@@ -197,6 +218,7 @@ func (t *terminal) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		t.input.Width = max(1, msg.Width-4)
 		return t, nil
 	case spinnerTick:
+		// Ignore a timer left over from a task that already finished.
 		if t.busy && msg.task == t.task {
 			t.frame++
 			return t, tick(t.task)
@@ -205,6 +227,7 @@ func (t *terminal) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case arc.Event:
 		line := t.handleEvent(msg)
 		if line != "" {
+			// Commit this line before consuming the next event.
 			return t, tea.Sequence(tea.Println(line), waitEvent(t.events))
 		}
 		return t, waitEvent(t.events)
@@ -273,6 +296,8 @@ func (t *terminal) setActivity(label string) {
 
 var spinnerFrames = []rune("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
 
+// View renders the current input, partial answer, and task status for one
+// Bubble Tea redraw.
 func (t *terminal) View() string {
 	prompt := "› "
 	if t.busy {
@@ -308,6 +333,8 @@ func usageLabel(usage arc.Usage) string {
 	return fmt.Sprintf("%d in · %d out · %d total", usage.InputTokens, usage.OutputTokens, usage.InputTokens+usage.OutputTokens)
 }
 
+// handleEvent updates the UI from one runtime event and returns any text
+// ready to commit to scrollback.
 func (t *terminal) handleEvent(event arc.Event) string {
 	switch event.Type {
 	case "turn_start":
@@ -331,6 +358,8 @@ func (t *terminal) handleEvent(event arc.Event) string {
 			t.activity = "responding"
 		}
 		if last := strings.LastIndexByte(t.partial, '\n'); last >= 0 {
+			// ANSI and Markdown styling run on complete lines. Keep the
+			// remaining bytes in the transient view.
 			line := t.formatLines(t.partial[:last])
 			t.partial = t.partial[last+1:]
 			if line == "" {
@@ -367,6 +396,8 @@ func (t *terminal) handleEvent(event arc.Event) string {
 	return ""
 }
 
+// approvalText shows the workspace and the command or deletions that need a
+// decision.
 func (t *terminal) approvalText(request arc.Authorization) string {
 	var lines []string
 	lines = append(lines, fmt.Sprintf("Approve %s in %s", request.Call.Name, safeText(request.CWD)))
@@ -386,6 +417,8 @@ func (t *terminal) approvalText(request arc.Authorization) string {
 	return strings.Join(append(lines, "Enter /approve or /deny."), "\n")
 }
 
+// quit requests immediate exit only when idle. Otherwise taskFinished
+// completes the exit after the worker has canceled.
 func (t *terminal) quit() tea.Cmd {
 	if !t.busy {
 		return tea.Quit
@@ -400,6 +433,7 @@ func (t *terminal) errorLine(err error) tea.Cmd {
 	return tea.Println(t.paint("error │ "+safeText(err.Error()), "31"))
 }
 
+// submit records an input line and routes it to a command or the agent.
 func (t *terminal) submit() tea.Cmd {
 	text := strings.TrimSpace(t.input.Value())
 	t.input.Reset()
@@ -423,6 +457,8 @@ func (t *terminal) submit() tea.Cmd {
 	return tea.Sequence(tea.Println(marker+safeText(text)), reply)
 }
 
+// dispatch handles a slash command or routes ordinary text to a new task
+// or the active task's steering queue.
 func (t *terminal) dispatch(command, argument, text string) tea.Cmd {
 	switch command {
 	case "/abort":
@@ -504,6 +540,8 @@ func (t *terminal) dispatch(command, argument, text string) tea.Cmd {
 		}
 		return tea.Println(content)
 	case "/branch", "/new", "/model", "/compact":
+		// These commands change the session cursor or model, or take
+		// exclusive ownership of the agent for compaction.
 		if t.busy {
 			return t.errorLine(errors.New("wait for completion or /abort first"))
 		}
@@ -559,6 +597,7 @@ func (t *terminal) dispatch(command, argument, text string) tea.Cmd {
 	return nil
 }
 
+// status renders a snapshot of the active configuration and task progress.
 func (t *terminal) status() string {
 	info := t.agent.Session.Info()
 	session := info.Path
@@ -604,6 +643,7 @@ func (t *terminal) status() string {
 	return safeText(strings.Join(lines, "\n"))
 }
 
+// complete fills in a unique slash command or shows all prefix matches.
 func (t *terminal) complete() tea.Cmd {
 	value := t.input.Value()
 	if !strings.HasPrefix(value, "/") || strings.ContainsRune(value, ' ') {
@@ -624,6 +664,8 @@ func (t *terminal) complete() tea.Cmd {
 	return nil
 }
 
+// loadHistory reads input lines from the existing history format, in which
+// content begins with "+" and metadata begins with "#".
 func (t *terminal) loadHistory() error {
 	if t.historyPath == "" {
 		return nil
@@ -651,6 +693,8 @@ func (t *terminal) loadHistory() error {
 	}
 }
 
+// saveHistory appends input to the in-memory list and, when configured, to
+// the workspace history file.
 func (t *terminal) saveHistory(text string) error {
 	if len(t.history) > 0 && t.history[len(t.history)-1] == text {
 		return nil
@@ -670,6 +714,8 @@ func (t *terminal) saveHistory(text string) error {
 	return errors.Join(err, file.Close())
 }
 
+// searchHistory walks entries that match the prefix typed before the search
+// and restores that prefix when moving past the newest match.
 func (t *terminal) searchHistory(direction int) {
 	if t.historyIndex < 0 {
 		t.historyPrefix = t.input.Value()
@@ -690,6 +736,8 @@ func (t *terminal) searchHistory(direction int) {
 	}
 }
 
+// safeText escapes control and bidirectional formatting characters before
+// display while keeping tabs and newlines for layout.
 func safeText(text string) string {
 	var result strings.Builder
 	for _, r := range text {
@@ -726,6 +774,9 @@ func contextLabel(status string) string {
 	}
 }
 
+// plainToolSummary selects a short result for the status line. A positive
+// width bounds ordinary output in terminal cells. Blocked calls keep their
+// full reason for the caller to format.
 func plainToolSummary(event arc.Event, width int) string {
 	content := strings.TrimSpace(safeText(event.Data["content"].(string)))
 	status := event.Data["status"].(string)
@@ -752,6 +803,7 @@ func plainToolSummary(event arc.Event, width int) string {
 	return content
 }
 
+// toolTarget describes what a call operates on without printing every argument.
 func toolTarget(call arc.ToolCall) string {
 	for _, key := range []string{"command", "path"} {
 		if value, ok := call.Arguments[key].(string); ok {
@@ -764,6 +816,8 @@ func toolTarget(call arc.ToolCall) string {
 	return singleLine(call.Name)
 }
 
+// toolLine formats one tool outcome, prioritizing status and duration on
+// narrow terminals.
 func (t *terminal) toolLine(snapshot toolSnapshot) string {
 	event := snapshot.event
 	marker, style := "✓", "32"
@@ -793,6 +847,8 @@ func (t *terminal) toolLine(snapshot toolSnapshot) string {
 var inlineMarkdown = regexp.MustCompile("`[^`\\n]+`|\\*\\*[^*\\n]+\\*\\*|__[^_\\n]+__|~~[^~\\n]+~~|\\*[^*\\n]+\\*|_[^_\\n]+_|\\[[^]\\n]+\\]\\([^\\n)]+\\)")
 var heading = regexp.MustCompile(`^#{1,6}\s+`)
 
+// formatLines renders a subset of Markdown on complete lines and remembers
+// fenced-code state across streamed chunks.
 func (t *terminal) formatLines(text string) string {
 	if !t.markdown || text == "" {
 		return text

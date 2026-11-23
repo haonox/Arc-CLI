@@ -31,6 +31,8 @@ func relativePath(root *os.Root, value string) (string, error) {
 	}
 	probe := path
 	var missing []string
+	// Resolve the deepest existing ancestor so new nested files can still
+	// be checked against the workspace and compared for aliasing.
 	for {
 		resolved, err := filepath.EvalSymlinks(probe)
 		if err == nil {
@@ -42,8 +44,7 @@ func relativePath(root *os.Root, value string) (string, error) {
 		if !errors.Is(err, os.ErrNotExist) || probe == root.Name() {
 			return "", err
 		}
-		// A dangling symlink still has a target. Let Root resolve and confine it
-		// instead of replacing the link with an unrelated regular file.
+		// Reject dangling symlinks so creating a file cannot replace the link itself.
 		if info, statErr := os.Lstat(probe); statErr == nil && info.Mode()&os.ModeSymlink != 0 {
 			return "", fmt.Errorf("dangling symlink: %s", probe)
 		}
@@ -52,7 +53,9 @@ func relativePath(root *os.Root, value string) (string, error) {
 	}
 }
 
+// readText returns a bounded UTF-8 file and its permissions.
 func readText(root *os.Root, path string) (string, os.FileMode, error) {
+	// Avoid blocking on a FIFO before verifying the opened file is regular.
 	file, err := root.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return "", 0, err
@@ -78,6 +81,7 @@ func readText(root *os.Root, path string) (string, os.FileMode, error) {
 	return string(data), info.Mode().Perm(), nil
 }
 
+// checkText enforces the byte limit and text requirements for file writes.
 func checkText(content string) error {
 	if len(content) > maxFileBytes {
 		return errors.New("file exceeds 1 MiB")
@@ -88,6 +92,8 @@ func checkText(content string) error {
 	return nil
 }
 
+// replaceFile stages complete content in the target directory. A rename
+// publishes an overwrite, and createOnly publishes via a non-clobbering link.
 func replaceFile(root *os.Root, path, content string, perm os.FileMode, createOnly bool) error {
 	if err := checkText(content); err != nil {
 		return err
@@ -103,6 +109,7 @@ func replaceFile(root *os.Root, path, content string, perm os.FileMode, createOn
 	defer directory.Close()
 	name := filepath.Base(path)
 	temp := ".arc-tmp-" + sessionID()
+	// Keep staged contents private until the final permissions are applied.
 	file, err := directory.OpenFile(temp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
 	if err != nil {
 		return err
@@ -124,6 +131,8 @@ func replaceFile(root *os.Root, path, content string, perm os.FileMode, createOn
 	return directory.Rename(temp, name)
 }
 
+// readFile returns a numbered window of normalized text and a continuation
+// offset when more lines remain.
 func readFile(root *os.Root, args Object) (string, error) {
 	path, err := relativePath(root, args["path"].(string))
 	if err != nil {
@@ -139,6 +148,7 @@ func readFile(root *os.Root, args Object) (string, error) {
 		lines = nil
 	}
 	offset := number(args, "offset", 1)
+	// Check the offset before converting it to a Go index.
 	if offset > float64(len(lines)) {
 		return "[Empty file or offset beyond end]", nil
 	}
@@ -158,6 +168,8 @@ func readFile(root *os.Root, args Object) (string, error) {
 	return content, nil
 }
 
+// writeFile creates a private file or replaces an existing regular file
+// while preserving its permissions.
 func writeFile(root *os.Root, args Object) (string, error) {
 	path, err := relativePath(root, args["path"].(string))
 	if err != nil {
@@ -179,6 +191,8 @@ func writeFile(root *os.Root, args Object) (string, error) {
 	return "Wrote " + filepath.Join(root.Name(), path), nil
 }
 
+// replaceText performs an exact substitution, requiring a unique match
+// unless all matches were requested.
 func replaceText(text, old, updated string, all bool) (string, error) {
 	matches := strings.Count(text, old)
 	switch {
@@ -191,6 +205,7 @@ func replaceText(text, old, updated string, all bool) (string, error) {
 	if all {
 		replacements = matches
 	}
+	// Check the expanded size before allocating the replacement string.
 	size := int64(len(text)) + int64(replacements)*int64(len(updated)-len(old))
 	if size > maxFileBytes {
 		return "", errors.New("file exceeds 1 MiB after replacement")
@@ -201,6 +216,7 @@ func replaceText(text, old, updated string, all bool) (string, error) {
 	return strings.Replace(text, old, updated, 1), nil
 }
 
+// editFile commits a validated text substitution with the original permissions.
 func editFile(root *os.Root, args Object) (string, error) {
 	path, err := relativePath(root, args["path"].(string))
 	if err != nil {
@@ -221,6 +237,7 @@ func editFile(root *os.Root, args Object) (string, error) {
 	return "Edited " + filepath.Join(root.Name(), path), nil
 }
 
+// patchChange holds the snapshots needed to commit and roll back one operation.
 type patchChange struct {
 	action, path  string
 	before, after string
@@ -228,6 +245,8 @@ type patchChange struct {
 	edits         int
 }
 
+// preparePatch resolves targets and computes replacement content without
+// modifying any file.
 func preparePatch(root *os.Root, operations []any) ([]patchChange, error) {
 	seen := make(map[string]bool, len(operations))
 	changes := make([]patchChange, 0, len(operations))
@@ -281,6 +300,8 @@ func preparePatch(root *os.Root, operations []any) ([]patchChange, error) {
 	return changes, nil
 }
 
+// checkPatchState detects content changes between preflight and commit or
+// between commit and rollback.
 func checkPatchState(root *os.Root, path, expected string) error {
 	current, _, err := readText(root, path)
 	if err != nil {
@@ -305,6 +326,8 @@ func (c patchChange) commit(root *os.Root) error {
 	return replaceFile(root, c.path, c.after, c.mode, false)
 }
 
+// rollback undoes one committed operation, checking the current contents to
+// avoid overwriting an intervening edit.
 func (c patchChange) rollback(root *os.Root) error {
 	if c.action == "delete" {
 		return replaceFile(root, c.path, c.before, c.mode, true)
@@ -318,6 +341,8 @@ func (c patchChange) rollback(root *os.Root) error {
 	return replaceFile(root, c.path, c.before, c.mode, false)
 }
 
+// applyPatch prepares all changes before committing them in request order.
+// A commit failure triggers a best-effort rollback in reverse order.
 func applyPatch(root *os.Root, args Object) (string, error) {
 	changes, err := preparePatch(root, args["operations"].([]any))
 	if err != nil {

@@ -16,13 +16,15 @@ import (
 	"time"
 )
 
+// ProviderOptions configures HTTP timeouts and model request parameters.
 type ProviderOptions struct {
-	Timeout         time.Duration
-	MaxTokens       int
-	Thinking        string
-	ReasoningEffort string
+	Timeout         time.Duration // Bounds connection setup and waits for response headers or stream activity.
+	MaxTokens       int           // A zero value leaves the output limit to the provider.
+	Thinking        string        // Empty preserves the default selected by NewProvider.
+	ReasoningEffort string        // Empty omits the effort unless another option selects it explicitly.
 }
 
+// OpenAIProvider implements [Provider] for streaming Chat Completions endpoints.
 type OpenAIProvider struct {
 	modelMu      sync.RWMutex
 	model        string
@@ -31,6 +33,8 @@ type OpenAIProvider struct {
 	options      ProviderOptions
 }
 
+// NewProvider validates the endpoint and request options, then creates a
+// direct HTTP client with redirect following disabled.
 func NewProvider(config Config, options ProviderOptions) (*OpenAIProvider, error) {
 	if strings.TrimSpace(config.Model) == "" || options.Timeout <= 0 {
 		return nil, errors.New("model and network timeout must be valid")
@@ -44,6 +48,7 @@ func NewProvider(config Config, options ProviderOptions) (*OpenAIProvider, error
 	if !slices.Contains([]string{"", "enabled", "disabled"}, options.Thinking) {
 		return nil, errors.New("--thinking must be enabled or disabled")
 	}
+	// Normalize accepted aliases before choosing the thinking mode for the wire request.
 	efforts := map[string]string{
 		"": "", "none": "none", "minimal": "low", "low": "low",
 		"medium": "high", "high": "high", "xhigh": "high", "max": "max",
@@ -88,22 +93,32 @@ func NewProvider(config Config, options ProviderOptions) (*OpenAIProvider, error
 	}, nil
 }
 
+// Model returns the model name used for new requests.
 func (p *OpenAIProvider) Model() string {
 	p.modelMu.RLock()
 	defer p.modelMu.RUnlock()
 	return p.model
 }
 
+// SetModel changes the model name for subsequent requests. An active request
+// has already captured its own name.
 func (p *OpenAIProvider) SetModel(model string) {
 	p.modelMu.Lock()
 	defer p.modelMu.Unlock()
 	p.model = model
 }
 
-func (p *OpenAIProvider) Endpoint() string         { return p.baseURL }
-func (p *OpenAIProvider) Options() ProviderOptions { return p.options }
-func (p *OpenAIProvider) Close()                   { p.client.CloseIdleConnections() }
+// Endpoint returns the configured API root without a trailing slash.
+func (p *OpenAIProvider) Endpoint() string { return p.baseURL }
 
+// Options returns the normalized settings used for requests.
+func (p *OpenAIProvider) Options() ProviderOptions { return p.options }
+
+// Close releases idle HTTP connections.
+func (p *OpenAIProvider) Close() { p.client.CloseIdleConnections() }
+
+// wireMessages converts projected conversation entries to Chat Completions
+// messages. The wire protocol represents tool arguments as JSON strings.
 func wireMessages(request ModelRequest) ([]Object, error) {
 	result := []Object{{"role": "system", "content": request.System}}
 	for _, m := range request.Messages {
@@ -134,6 +149,9 @@ func wireMessages(request ModelRequest) ([]Object, error) {
 	return result, nil
 }
 
+// Stream sends a Chat Completions request and delivers deltas to emit in wire
+// order. The returned reply contains proposals only after a valid finish
+// reason and stream terminator have been received.
 func (p *OpenAIProvider) Stream(ctx context.Context, request ModelRequest, emit func(ModelDelta) error) (ModelReply, error) {
 	messages, err := wireMessages(request)
 	if err != nil {
@@ -186,6 +204,8 @@ func (p *OpenAIProvider) Stream(ctx context.Context, request ModelRequest, emit 
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
 		return ModelReply{}, fmt.Errorf("model HTTP %d; check endpoint, model and credentials", res.StatusCode)
 	}
+	// Use a resettable timer to bound inactivity during streaming, including
+	// long responses that continue to make progress.
 	timer := time.AfterFunc(p.options.Timeout, func() { cancel(errors.New("model stream timed out")) })
 	defer timer.Stop()
 	reply, err := parseStream(res.Body, emit, func() { timer.Reset(p.options.Timeout) })
@@ -195,6 +215,7 @@ func (p *OpenAIProvider) Stream(ctx context.Context, request ModelRequest, emit 
 	return reply, err
 }
 
+// streamChunk is one wire frame. A final usage frame can arrive without a choice.
 type streamChunk struct {
 	Error json.RawMessage `json:"error"`
 	Usage *struct {
@@ -221,8 +242,11 @@ type streamChunk struct {
 	} `json:"choices"`
 }
 
+// callFragments accumulates strings that may be split across several frames.
 type callFragments struct{ id, name, arguments strings.Builder }
 
+// parseStream assembles tool fragments by index and checks that the entire
+// reply is valid before returning any tool proposals.
 func parseStream(reader io.Reader, emit func(ModelDelta) error, activity func()) (ModelReply, error) {
 	var reply ModelReply
 	calls := map[int]*callFragments{}
@@ -239,6 +263,8 @@ func parseStream(reader io.Reader, emit func(ModelDelta) error, activity func())
 			reply.Usage = &Usage{InputTokens: chunk.Usage.Input, OutputTokens: chunk.Usage.Output}
 		}
 		for _, choice := range chunk.Choices {
+			// Arc requests a single choice. After it finishes, only frames
+			// without choices may contribute usage.
 			if choice.Index != 0 || finish != "" {
 				return errors.New("unexpected choice in model stream")
 			}
@@ -288,6 +314,7 @@ func parseStream(reader io.Reader, emit func(ModelDelta) error, activity func())
 	for index := range calls {
 		indexes = append(indexes, index)
 	}
+	// Indices define execution order even if fragments arrived interleaved.
 	slices.Sort(indexes)
 	seen := map[string]bool{}
 	for _, index := range indexes {
@@ -303,6 +330,8 @@ func parseStream(reader io.Reader, emit func(ModelDelta) error, activity func())
 	return reply, nil
 }
 
+// readSSE combines data lines into events, bounds their payload size, and
+// requires the Chat Completions [DONE] terminator.
 func readSSE(reader io.Reader, activity func(), consume func(string) error) error {
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 4096), 2_000_010)
@@ -324,6 +353,7 @@ func readSSE(reader io.Reader, activity func(), consume func(string) error) erro
 		return false, consume(data)
 	}
 	for scanner.Scan() {
+		// Comments and blank lines can be heartbeats even when they carry no payload.
 		activity()
 		line := scanner.Text()
 		if line == "" {
@@ -342,6 +372,7 @@ func readSSE(reader io.Reader, activity func(), consume func(string) error) erro
 	if scanner.Err() != nil {
 		return errors.New("model stream interrupted or invalid")
 	}
+	// Accept a final terminator even when the peer omits its blank separator.
 	if done, err := drain(); done || err != nil {
 		return err
 	}

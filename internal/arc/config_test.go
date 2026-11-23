@@ -8,6 +8,7 @@ import (
 	"testing"
 )
 
+// writeFixture creates a private fixture and its parent directory.
 func writeFixture(t *testing.T, path, text string) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {

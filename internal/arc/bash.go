@@ -13,6 +13,8 @@ import (
 	"time"
 )
 
+// runBash runs an authorized command in its own process group. It streams
+// combined output and cleans up the group on exit, cancellation, or timeout.
 func runBash(ctx context.Context, args Object, env ToolEnv, emit func(string) error) ToolResult {
 	ctx, cancel := context.WithTimeout(ctx, time.Duration(number(args, "timeout", 120)*float64(time.Second)))
 	defer cancel()
@@ -28,6 +30,7 @@ func runBash(ctx context.Context, args Object, env ToolEnv, emit func(string) er
 	command.Dir = env.CWD
 	command.Env = env.Env
 	if command.Env == nil {
+		// A nil Cmd.Env would inherit the parent process's unfiltered environment.
 		command.Env = []string{}
 	}
 	command.Stdout, command.Stderr = writePipe, writePipe
@@ -47,6 +50,8 @@ func runBash(ctx context.Context, args Object, env ToolEnv, emit func(string) er
 			}
 		})
 	}()
+	// Kill the entire group even when Bash exits first. Background children
+	// can outlive their parent and still hold the output pipe.
 	select {
 	case err = <-wait:
 		_ = syscall.Kill(-command.Process.Pid, syscall.SIGKILL)
@@ -72,6 +77,8 @@ func runBash(ctx context.Context, args Object, env ToolEnv, emit func(string) er
 	return ToolResult{Content: fmt.Sprintf("%s\n[Exit code: %d]", text, command.ProcessState.ExitCode()), IsError: err != nil}
 }
 
+// collectOutput streams rune-aligned chunks and retains enough output for the
+// final tool result. It keeps draining the pipe after reaching the limit.
 func collectOutput(file *os.File, emit func(string)) string {
 	reader := bufio.NewReader(file)
 	var output, delta strings.Builder
@@ -90,6 +97,7 @@ func collectOutput(file *os.File, emit func(string)) string {
 		}
 		if kept == maxOutput {
 			truncated = true
+			// Draining prevents a verbose process from blocking on a full pipe.
 			_, _ = io.Copy(io.Discard, reader)
 			break
 		}

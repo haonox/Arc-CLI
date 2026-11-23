@@ -21,6 +21,8 @@ import (
 	"unicode/utf8"
 )
 
+// sessionEntry represents one v1 JSONL record. Message and checkpoint records
+// form the tree. Cursor and title records update its metadata.
 type sessionEntry struct {
 	Type      string    `json:"type"`
 	Version   int       `json:"version,omitempty"`
@@ -34,17 +36,21 @@ type sessionEntry struct {
 	Title     string    `json:"title,omitempty"`
 }
 
-// Session holds one append-only tree. Titles and cursor changes do not create message nodes.
+// Session holds an append-only conversation tree and a cursor to its active
+// branch. A session built by CreateSession or OpenSession protects its state
+// with a mutex and keeps an exclusive lock while its file is open.
 type Session struct {
 	mu            sync.RWMutex
 	path, cwd, id string
 	file          *os.File
-	needsNewline  bool
+	needsNewline  bool // The previous record ended at EOF without its newline.
 	leaf, title   string
 	nodes         map[string]sessionEntry
-	order         []string
+	order         []string // Node IDs in append order, independent of the cursor.
 }
 
+// SessionInfo is a snapshot of session metadata. Path is empty for an
+// in-memory session, and Leaf is empty when the cursor is at the root.
 type SessionInfo struct {
 	Path, CWD, ID, Title, Leaf string
 }
@@ -55,6 +61,8 @@ func sessionID() string {
 	return hex.EncodeToString(data[:])
 }
 
+// CreateSession starts an empty session for cwd. An empty path selects memory
+// storage. Otherwise, the path must be new and remains locked until Close.
 func CreateSession(cwd, path string) (*Session, error) {
 	s := &Session{cwd: cwd, path: path, id: sessionID(), nodes: map[string]sessionEntry{}}
 	if path == "" {
@@ -80,6 +88,8 @@ func CreateSession(cwd, path string) (*Session, error) {
 	return s, nil
 }
 
+// OpenSession locks and replays an existing v1 session. A corrupt record
+// causes an error and leaves the file untouched.
 func OpenSession(path string) (*Session, error) {
 	file, err := os.OpenFile(path, os.O_RDWR|os.O_APPEND, 0)
 	if err != nil {
@@ -93,6 +103,8 @@ func OpenSession(path string) (*Session, error) {
 	return s, nil
 }
 
+// lockSession acquires a nonblocking write lock and verifies that the file
+// still occupies the requested path.
 func lockSession(file *os.File, path string) error {
 	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		return fmt.Errorf("cannot lock session for writing: %w", err)
@@ -105,6 +117,7 @@ func lockSession(file *os.File, path string) error {
 	if err != nil {
 		return err
 	}
+	// Archive or restore may have moved the file between open and lock.
 	if !os.SameFile(opened, current) {
 		return errors.New("session moved while opening it; refresh the session list")
 	}
@@ -114,6 +127,7 @@ func lockSession(file *os.File, path string) error {
 	return nil
 }
 
+// load validates and replays a session while acquiring its file lock.
 func (s *Session) load() error {
 	if err := lockSession(s.file, s.path); err != nil {
 		return err
@@ -135,6 +149,7 @@ func (s *Session) load() error {
 		if err != nil && err != io.EOF {
 			return err
 		}
+		// A valid record at EOF can be recovered even without a final newline.
 		if len(line) > 0 {
 			var entry sessionEntry
 			if !utf8.Valid(line) || decodeJSON(line, &entry) != nil || s.apply(entry) != nil {
@@ -148,6 +163,8 @@ func (s *Session) load() error {
 	}
 }
 
+// write appends and syncs a record before the caller updates in-memory state.
+// The caller holds mu once the session is shared.
 func (s *Session) write(value any) error {
 	if s.file == nil {
 		if s.path == "" {
@@ -163,6 +180,8 @@ func (s *Session) write(value any) error {
 		line = append([]byte{'\n'}, line...)
 	}
 	line = append(line, '\n')
+	// Remember the original end so a failed write or sync can roll back
+	// a partially appended record.
 	position, err := s.file.Seek(0, io.SeekEnd)
 	if err != nil {
 		return err
@@ -177,6 +196,8 @@ func (s *Session) write(value any) error {
 	return nil
 }
 
+// apply replays one record into memory. A parent must already be present,
+// which keeps the append-order tree acyclic.
 func (s *Session) apply(entry sessionEntry) error {
 	switch entry.Type {
 	case "cursor":
@@ -227,6 +248,8 @@ func (s *Session) apply(entry sessionEntry) error {
 	return nil
 }
 
+// append attaches a validated node to the active cursor and persists it
+// before changing the active branch.
 func (s *Session) append(entry sessionEntry) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -237,6 +260,7 @@ func (s *Session) append(entry sessionEntry) (string, error) {
 	}
 	var value any = entry
 	if entry.Type == "checkpoint" {
+		// The wire format requires messages even for an empty checkpoint.
 		value = Object{"type": "checkpoint", "id": entry.ID, "parent": entry.Parent, "messages": entry.Messages}
 	}
 	if err := s.write(value); err != nil {
@@ -245,6 +269,8 @@ func (s *Session) append(entry sessionEntry) (string, error) {
 	return entry.ID, s.apply(entry)
 }
 
+// Append copies and stores a message on the active branch, returning its
+// session node ID.
 func (s *Session) Append(message Message) (string, error) {
 	if err := message.validate(); err != nil {
 		return "", err
@@ -253,6 +279,8 @@ func (s *Session) Append(message Message) (string, error) {
 	return s.append(sessionEntry{Type: "message", Message: &detached})
 }
 
+// Checkpoint appends a replacement view of the active history. Earlier
+// nodes remain available for branching.
 func (s *Session) Checkpoint(messages []Message) error {
 	detached := make([]Message, len(messages))
 	for i, message := range messages {
@@ -265,6 +293,8 @@ func (s *Session) Checkpoint(messages []Message) error {
 	return err
 }
 
+// Branch moves the cursor to the node with a unique ID prefix. The special
+// prefix "root" starts the next append from an empty conversation.
 func (s *Session) Branch(prefix string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -297,6 +327,7 @@ func validateTitle(title string) error {
 	return nil
 }
 
+// Rename records a printable title for a saved session.
 func (s *Session) Rename(title string) error {
 	title = strings.TrimSpace(title)
 	if err := validateTitle(title); err != nil {
@@ -314,16 +345,22 @@ func (s *Session) Rename(title string) error {
 	return nil
 }
 
+// Info returns a snapshot of the current session metadata.
 func (s *Session) Info() SessionInfo {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return SessionInfo{Path: s.path, CWD: s.cwd, ID: s.id, Title: s.title, Leaf: s.leaf}
 }
 
+// Messages returns a detached, chronological view of the active branch.
+// An interrupted tool call is represented by a synthesized error result in
+// the returned view.
 func (s *Session) Messages() []Message {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	var messages []Message
+	// Follow parent links from the leaf. The nearest checkpoint already
+	// contains the context to use for its entire prefix.
 	for id := s.leaf; id != ""; {
 		entry := s.nodes[id]
 		if entry.Type == "checkpoint" {
@@ -342,6 +379,8 @@ func (s *Session) Messages() []Message {
 	return repairTools(messages)
 }
 
+// repairTools pairs each tool proposal with a result, fills missing results
+// with an interruption message, and drops results outside the active batch.
 func repairTools(messages []Message) []Message {
 	result := make([]Message, 0, len(messages))
 	var pending []ToolCall
@@ -373,9 +412,12 @@ func repairTools(messages []Message) []Message {
 	return result
 }
 
+// Tree returns a terminal-friendly rendering of every branch with the
+// active cursor marked.
 func (s *Session) Tree() []string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	// Index children by parent so rendering preserves the order of siblings.
 	children := map[string][]string{}
 	for _, id := range s.order {
 		node, parent := s.nodes[id], ""
@@ -435,6 +477,7 @@ func (s *Session) Tree() []string {
 	return lines
 }
 
+// Close releases the backing file and its lock. It is safe to call twice.
 func (s *Session) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -446,10 +489,13 @@ func (s *Session) Close() error {
 	return err
 }
 
+// SessionCatalog locates saved sessions and input history for one workspace.
 type SessionCatalog struct {
 	directory string
 }
 
+// NewCatalog derives the workspace's state directory from its canonical path
+// and an absolute XDG_STATE_HOME, with a fallback to the user's local state.
 func NewCatalog(cwd string, getenv func(string) string) SessionCatalog {
 	state := getenv("XDG_STATE_HOME")
 	if !filepath.IsAbs(state) {
@@ -460,19 +506,23 @@ func NewCatalog(cwd string, getenv func(string) string) SessionCatalog {
 	return SessionCatalog{directory: filepath.Join(state, "arc", "workspaces", hex.EncodeToString(hash[:]))}
 }
 
+// HistoryPath returns the shared input history path for the workspace.
 func (c SessionCatalog) HistoryPath() string { return filepath.Join(c.directory, "input-history") }
 
+// NewPath returns a path for a new session without creating the file.
 func (c SessionCatalog) NewPath() string {
 	name := time.Now().UTC().Format("20060102T150405") + "-" + sessionID()[:8] + ".jsonl"
 	return filepath.Join(c.directory, "sessions", name)
 }
 
+// SavedSession is the file metadata and most recent title shown by the catalog.
 type SavedSession struct {
 	ID, Path, Title string
 	Size            int64
 	Modified        time.Time
 }
 
+// list reads metadata from one catalog directory, most recently modified first.
 func (c SessionCatalog) list(archived bool, prefix string, titles bool) ([]SavedSession, error) {
 	directory := "sessions"
 	if archived {
@@ -522,6 +572,8 @@ func (c SessionCatalog) list(archived bool, prefix string, titles bool) ([]Saved
 	return records, nil
 }
 
+// catalogMetadata reads session IDs without replaying the tree. Only listing
+// with titles needs to scan beyond the header.
 func catalogMetadata(path, prefix string, titleWanted bool) (string, string, error) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -547,6 +599,7 @@ func catalogMetadata(path, prefix string, titleWanted bool) (string, string, err
 		if err != nil && err != io.EOF {
 			return "", "", err
 		}
+		// Skip decoding ordinary message records while scanning for titles.
 		if bytes.Contains(line, []byte("\"title\"")) {
 			var entry struct{ Type, Title string }
 			if json.Unmarshal(line, &entry) == nil && entry.Type == "title" && validateTitle(entry.Title) == nil {
@@ -559,10 +612,12 @@ func catalogMetadata(path, prefix string, titleWanted bool) (string, string, err
 	}
 }
 
+// List returns active or archived sessions in reverse modification order.
 func (c SessionCatalog) List(archived bool) ([]SavedSession, error) {
 	return c.list(archived, "", true)
 }
 
+// Latest returns the path of the most recently modified active session.
 func (c SessionCatalog) Latest() (string, error) {
 	results, err := c.list(false, "", false)
 	if err != nil {
@@ -574,6 +629,8 @@ func (c SessionCatalog) Latest() (string, error) {
 	return results[0].Path, nil
 }
 
+// Find returns the path of the unique session matching a nonempty ID prefix
+// in the active or archived directory.
 func (c SessionCatalog) Find(prefix string, archived bool) (string, error) {
 	results, err := c.list(archived, prefix, false)
 	if err != nil {
@@ -585,6 +642,8 @@ func (c SessionCatalog) Find(prefix string, archived bool) (string, error) {
 	return results[0].Path, nil
 }
 
+// Move archives a saved session or restores it when restore is true. It holds
+// the session's exclusive lock through the rename and returns the new path.
 func (c SessionCatalog) Move(prefix string, restore bool) (string, error) {
 	source, err := c.Find(prefix, restore)
 	if err != nil {

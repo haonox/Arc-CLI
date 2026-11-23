@@ -9,31 +9,44 @@ import (
 	"time"
 )
 
+// Hooks customize tool handling after authorization. The arguments passed to
+// each hook are copies of the validated proposal.
 type Hooks struct {
+	// BeforeTool can stop the authorized call by returning an error.
 	BeforeTool func(context.Context, ToolCall, ToolEnv) error
-	AfterTool  func(context.Context, ToolCall, ToolResult) (ToolResult, error)
+	// AfterTool can replace the result before it is recorded.
+	AfterTool func(context.Context, ToolCall, ToolResult) (ToolResult, error)
 }
 
-// Agent runs one task at a time. Steering and follow-ups may arrive while it runs.
+// Agent runs one task at a time against a session. Configure its fields before
+// calling Run or Compact. Steer and FollowUp may be called during an active run.
 type Agent struct {
-	Provider                Provider
-	Session                 *Session
-	Tools                   *Registry
-	Environment             ToolEnv
-	SystemPrompt            func() string
-	InstructionContext      []Message
-	TransformContext        func(context.Context, []Message) ([]Message, error)
-	Policy                  string
-	Approve                 Approver
-	Hooks                   Hooks
+	Provider    Provider
+	Session     *Session
+	Tools       *Registry
+	Environment ToolEnv
+	// SystemPrompt is called for each model turn so runtime details can change.
+	SystemPrompt func() string
+	// InstructionContext is the prefix sent with each turn's projected history.
+	InstructionContext []Message
+	// TransformContext optionally edits a snapshot of history for a request.
+	// Providing a transform disables automatic compaction for that run.
+	TransformContext func(context.Context, []Message) ([]Message, error)
+	Policy           string
+	Approve          Approver // Nil keeps calls that require approval from running.
+	Hooks            Hooks
+	// MaxTurns bounds model turns per run. ContextBudget bounds estimated
+	// input tokens per request when positive.
 	MaxTurns, ContextBudget int
-	AutoCompact             bool
+	AutoCompact             bool // Try a summary once when the turn nears the budget.
 
-	mu                  sync.Mutex
+	mu                  sync.Mutex // Protects running and both prompt queues.
 	running             bool
 	steering, followups []string
 }
 
+// Steer queues nonblank text for the next model turn, including a turn
+// following tool execution.
 func (a *Agent) Steer(text string) {
 	if strings.TrimSpace(text) == "" {
 		return
@@ -43,6 +56,8 @@ func (a *Agent) Steer(text string) {
 	a.steering = append(a.steering, text)
 }
 
+// FollowUp queues nonblank text for the point when the current tool loop would
+// otherwise finish.
 func (a *Agent) FollowUp(text string) {
 	if strings.TrimSpace(text) == "" {
 		return
@@ -52,6 +67,8 @@ func (a *Agent) FollowUp(text string) {
 	a.followups = append(a.followups, text)
 }
 
+// takeSteering transfers the current queue to the run so new input can be
+// enqueued while that turn is in progress.
 func (a *Agent) takeSteering() []string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -60,6 +77,8 @@ func (a *Agent) takeSteering() []string {
 	return steering
 }
 
+// hasNextTurn gives steering priority, then promotes one follow-up into the
+// next turn's steering queue.
 func (a *Agent) hasNextTurn() bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -74,6 +93,7 @@ func (a *Agent) hasNextTurn() bool {
 	return true
 }
 
+// begin reserves the agent for either a run or a manual compaction.
 func (a *Agent) begin() error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -91,6 +111,9 @@ func (a *Agent) end() {
 	a.steering, a.followups = nil, nil
 }
 
+// Compact summarizes older turns and appends a checkpoint while keeping the
+// most recent keep user turns. A failed or canceled summary leaves the
+// current branch unchanged.
 func (a *Agent) Compact(ctx context.Context, keep int) error {
 	if err := a.begin(); err != nil {
 		return err
@@ -106,15 +129,18 @@ func (a *Agent) Compact(ctx context.Context, keep int) error {
 	return a.Session.Checkpoint(messages)
 }
 
+// runState tracks the unfinished turn and the tool results still owed to it.
 type runState struct {
 	agent               *Agent
 	observe             Observer
 	observerError       error
-	turn                int
-	pending             []ToolCall
+	turn                int        // Nonzero while a turn still needs a terminal event.
+	pending             []ToolCall // In model order, with each call removed after its result is recorded.
 	attemptedCompaction bool
 }
 
+// emit remembers the first observer failure so later cleanup can stop sending
+// events to that observer while still updating the session.
 func (r *runState) emit(kind string, data Object) error {
 	if r.observerError != nil {
 		return r.observerError
@@ -132,8 +158,11 @@ func (r *runState) append(message Message) error {
 	return r.emit("message_end", Object{"message": message})
 }
 
-// Run keeps each complete result durable before telling the observer. When a
-// consumer or tool stops mid-call, deferred cleanup leaves an explicit result.
+// Run processes a prompt through model turns and authorized tools. It returns
+// the final task status and any error. A nil observer discards events.
+//
+// Run records completed tool results before notifying the observer. On
+// interruption it records an error for each pending tool proposal.
 func (a *Agent) Run(ctx context.Context, prompt string, observe Observer) (status string, err error) {
 	if strings.TrimSpace(prompt) == "" {
 		return "error", errors.New("prompt cannot be empty")
@@ -147,6 +176,8 @@ func (a *Agent) Run(ctx context.Context, prompt string, observe Observer) (statu
 	defer a.end()
 	run := runState{agent: a, observe: observe}
 	defer func() {
+		// The model may have proposed a batch before cancellation. Give every
+		// unfinished proposal a result, even if the UI has stopped consuming events.
 		for _, call := range run.pending {
 			_, saveErr := a.Session.Append(toolMessage(call,
 				"Interrupted. Side effects may have occurred; inspect state before retrying.", true))
@@ -200,6 +231,7 @@ func (a *Agent) Run(ctx context.Context, prompt string, observe Observer) (statu
 		for _, call := range reply.Calls {
 			recorded, err := run.execute(ctx, call, reply.StopReason)
 			if recorded {
+				// A delivery error after persistence still leaves a valid result.
 				run.pending = run.pending[1:]
 			}
 			if err != nil {
@@ -230,6 +262,8 @@ func (a *Agent) Run(ctx context.Context, prompt string, observe Observer) (statu
 	return "max_turns", fmt.Errorf("reached max_turns=%d", a.MaxTurns)
 }
 
+// modelContext projects the active branch and budgets its history after
+// reserving space for system instructions, configuration, and tool schemas.
 func (r *runState) modelContext(ctx context.Context, system string, tools []ToolSpec) ([]Message, error) {
 	a := r.agent
 	history := a.Session.Messages()
@@ -247,6 +281,8 @@ func (r *runState) modelContext(ctx context.Context, system string, tools []Tool
 		available := budget - requestOverhead(system, tools) - messagesCost(a.InstructionContext)
 		cost := messagesCost(messages)
 		nearLimit := cost >= available-available/10
+		// Summarization costs a separate model request. Try it once per run,
+		// and use trimming if the result cannot reduce the context.
 		if nearLimit && a.AutoCompact && a.TransformContext == nil && !r.attemptedCompaction && countUserTurns(history) > 2 {
 			r.attemptedCompaction = true
 			if err := r.emit("context_budget", Object{"status": "compacting"}); err != nil {
@@ -301,6 +337,8 @@ func countUserTurns(messages []Message) int {
 	return count
 }
 
+// modelTurn streams one response, records it, and exposes only complete
+// proposals to the tool loop.
 func (r *runState) modelTurn(ctx context.Context) (ModelReply, error) {
 	system := r.agent.SystemPrompt()
 	tools := r.agent.Tools.Specs()
@@ -314,6 +352,7 @@ func (r *runState) modelTurn(ctx context.Context) (ModelReply, error) {
 	var text, reasoning strings.Builder
 	reply, err := r.agent.Provider.Stream(ctx, ModelRequest{System: system, Messages: messages, Tools: tools},
 		func(delta ModelDelta) error {
+			// Keep reasoning for provider round trips and stream only answer text to the UI.
 			reasoning.WriteString(delta.Reasoning)
 			if delta.Text == "" {
 				return nil
@@ -326,6 +365,8 @@ func (r *runState) modelTurn(ctx context.Context) (ModelReply, error) {
 	}
 	message := Message{Role: "assistant", Content: text.String(), Reasoning: reasoning.String(), StopReason: &reply.StopReason}
 	if err != nil {
+		// Preserve the partial answer for local history and mark it for
+		// exclusion from the next provider request.
 		reason := "error"
 		if ctx.Err() != nil || r.observerError != nil {
 			reason = "aborted"
@@ -341,6 +382,8 @@ func (r *runState) modelTurn(ctx context.Context) (ModelReply, error) {
 	return reply, r.emit("message_end", Object{"message": message})
 }
 
+// validateReply checks provider-independent invariants before accepting any
+// proposals in a response.
 func validateReply(reply ModelReply) error {
 	switch reply.StopReason {
 	case "tool_use":
@@ -365,6 +408,9 @@ func validateReply(reply ModelReply) error {
 	return nil
 }
 
+// execute validates and authorizes a proposal before invoking its tool. The
+// boolean reports whether the corresponding result was recorded, even if
+// subsequent event delivery failed.
 func (r *runState) execute(ctx context.Context, call ToolCall, stop string) (bool, error) {
 	a := r.agent
 	started := time.Now()
@@ -377,6 +423,7 @@ func (r *runState) execute(ctx context.Context, call ToolCall, stop string) (boo
 	var result ToolResult
 	var tool Tool
 	if stop == "tool_use" {
+		// Effect functions expect schema-validated arguments.
 		var err error
 		tool, err = a.Tools.validate(call)
 		if err != nil {
@@ -424,6 +471,8 @@ func (r *runState) execute(ctx context.Context, call ToolCall, stop string) (boo
 	return true, r.emit("message_end", Object{"message": message})
 }
 
+// invoke runs the authorized tool and its hooks, forwarding progress events
+// and returning the final result to the caller for persistence.
 func (r *runState) invoke(ctx context.Context, tool Tool, call ToolCall, started time.Time) ToolResult {
 	a := r.agent
 	if a.Hooks.BeforeTool != nil {

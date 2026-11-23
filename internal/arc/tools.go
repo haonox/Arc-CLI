@@ -14,21 +14,28 @@ import (
 )
 
 const maxFileBytes = 1024 * 1024
-const maxOutput = 24000
+const maxOutput = 24000 // Tool output limit in runes, excluding status and truncation text.
 
+// ToolResult is the content and error status of a single tool execution.
 type ToolResult struct {
 	Content string
 	IsError bool
 }
 
+// ToolEnv supplies the working directory and filtered subprocess environment.
 type ToolEnv struct {
 	CWD string
 	Env []string
 }
 
+// Tool binds its model-facing schema to effect classification and execution.
+// The runtime validates arguments against Spec before calling Effects, then
+// authorizes the declared effects before calling Execute.
 type Tool struct {
 	Spec    ToolSpec
 	Effects func(Object) []string
+	// Execute may send incremental output using the callback, then returns the
+	// final result that the runtime records in the session.
 	Execute func(context.Context, Object, ToolEnv, func(string) error) ToolResult
 }
 
@@ -37,11 +44,15 @@ type registeredTool struct {
 	schema *jsonschema.Schema
 }
 
+// Registry indexes the available tools and their compiled schemas while
+// preserving registration order for model requests.
 type Registry struct {
 	names []string
 	tools map[string]registeredTool
 }
 
+// NewRegistry validates tool definitions and compiles their argument schemas
+// using JSON Schema Draft 2020-12 by default.
 func NewRegistry(tools []Tool) (*Registry, error) {
 	registry := &Registry{tools: map[string]registeredTool{}}
 	compiler := jsonschema.NewCompiler()
@@ -57,6 +68,8 @@ func NewRegistry(tools []Tool) (*Registry, error) {
 		if err != nil {
 			return nil, err
 		}
+		// Normalize Go literals such as []string into the JSON value types
+		// expected by the schema compiler.
 		if err := decodeJSON(data, &schemaDoc); err != nil {
 			return nil, err
 		}
@@ -73,6 +86,7 @@ func NewRegistry(tools []Tool) (*Registry, error) {
 	return registry, nil
 }
 
+// Specs returns the registered tool specifications in request order.
 func (r *Registry) Specs() []ToolSpec {
 	specs := make([]ToolSpec, 0, len(r.names))
 	for _, name := range r.names {
@@ -81,8 +95,10 @@ func (r *Registry) Specs() []ToolSpec {
 	return specs
 }
 
+// Names returns a detached list of registered tool names in request order.
 func (r *Registry) Names() []string { return slices.Clone(r.names) }
 
+// validate resolves a proposal against the available tools and checks its schema.
 func (r *Registry) validate(call ToolCall) (Tool, error) {
 	tool, ok := r.tools[call.Name]
 	if !ok {
@@ -97,17 +113,24 @@ func (r *Registry) validate(call ToolCall) (Tool, error) {
 	return tool.Tool, nil
 }
 
+// Authorization describes a validated proposal, the workspace it targets,
+// and the effects that the runtime will authorize.
 type Authorization struct {
 	Call    ToolCall
 	CWD     string
 	Effects []string
 }
 
+// Approver asks the caller to approve effects that require confirmation.
+// A false result or an error prevents execution.
 type Approver func(context.Context, Authorization) (bool, error)
 
 const (
-	Confirm    = "confirm"
+	// Confirm automatically allows read and write effects and asks about the rest.
+	Confirm = "confirm"
+	// Autonomous automatically allows all known effects.
 	Autonomous = "autonomous"
+	// Restricted allows read, write, and process effects and blocks the others.
 	Restricted = "restricted"
 )
 
@@ -115,6 +138,7 @@ type decision struct {
 	status, reason string
 }
 
+// authorize applies the policy to every declared effect before any dispatch.
 func authorize(ctx context.Context, mode string, request Authorization, approval Approver) decision {
 	var pending []string
 	for _, effect := range request.Effects {
@@ -151,6 +175,9 @@ func authorize(ctx context.Context, mode string, request Authorization, approval
 var providerEnv = []string{"ARC_API_KEY", "ARC_BASE_URL", "ARC_MODEL", "DEEPSEEK_API_KEY"}
 var secretPattern = regexp.MustCompile(`(?i)(?:^|_)(?:API_?KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIALS?|PRIVATE_KEY)(?:$|_)`)
 
+// ToolEnvironment filters NAME=value entries for tool subprocesses.
+// Explicit denies and provider settings take precedence over all allows.
+// Allows can opt into other names matched by the sensitive-variable filter.
 func ToolEnvironment(environ, allow, deny, credentialNames []string) []string {
 	allowed, denied := map[string]bool{}, map[string]bool{}
 	for _, name := range allow {
@@ -178,6 +205,8 @@ func fixedEffects(names ...string) func(Object) []string {
 var externalCommand = regexp.MustCompile(`(?i)(?:^|[;&|()\n])\s*(?:(?:sudo|command|exec|nohup)\s+)*(?:curl\b|wget\b|ssh\b|scp\b|sftp\b|nc\b|ncat\b|telnet\b|ftp\b|git\s+(?:clone|fetch|pull|push)\b|(?:pip[0-9.]*|python[0-9.]*\s+-m\s+pip)\s+install\b|npm\s+install\b|uv\s+add\b)`)
 var destructiveCommand = regexp.MustCompile(`(?i)(?:^|[;&|()\n])\s*(?:(?:sudo|command|exec|nohup)\s+)*(?:rm\b|rmdir\b|unlink\b|shred\b|mkfs(?:\.[a-z0-9]+)?\b|fdisk\b|shutdown\b|reboot\b|git\s+(?:reset\s+--hard|clean\b))|\bdrop\s+(?:database|table)\b`)
 
+// bashEffects adds conservative hints based on the command text. These
+// hints inform authorization, and Bash runs with the user's OS permissions.
 func bashEffects(args Object) []string {
 	effects := []string{"process"}
 	command := args["command"].(string)
@@ -190,6 +219,7 @@ func bashEffects(args Object) []string {
 	return effects
 }
 
+// patchEffects marks the whole patch as destructive if any operation deletes a file.
 func patchEffects(args Object) []string {
 	for _, operation := range args["operations"].([]any) {
 		if operation.(Object)["type"] == "delete" {
@@ -203,6 +233,7 @@ func objectSchema(properties Object, required ...string) Object {
 	return Object{"type": "object", "properties": properties, "required": required, "additionalProperties": false}
 }
 
+// BuiltinTools returns Arc's file, patch, and shell tools in request order.
 func BuiltinTools() []Tool {
 	text := Object{"type": "string"}
 	nonempty := Object{"type": "string", "minLength": 1}
@@ -213,6 +244,7 @@ func BuiltinTools() []Tool {
 		maps.Copy(properties, fields)
 		return objectSchema(properties, append([]string{"type", "path"}, required...)...)
 	}
+	// The operation type selects its own schema and required fields.
 	patch := Object{"oneOf": []Object{
 		operation("add", Object{"content": bounded}, "content"),
 		operation("update", Object{"edits": Object{"type": "array", "minItems": 1, "maxItems": 100, "items": edits}}, "edits"),
@@ -238,6 +270,9 @@ func BuiltinTools() []Tool {
 	}
 }
 
+// SelectTools constructs a registry from the comma-separated allowlist.
+// An omitted option enables every built-in tool. An explicit empty value or
+// "none" enables zero tools.
 func SelectTools(value string, supplied bool) (*Registry, error) {
 	tools := BuiltinTools()
 	if !supplied {
@@ -264,6 +299,8 @@ func SelectTools(value string, supplied bool) (*Registry, error) {
 
 func failed(err error) ToolResult { return ToolResult{Content: err.Error(), IsError: true} }
 
+// fileTool gives each invocation a rooted view of the workspace and adapts
+// ordinary file errors to tool results.
 func fileTool(operation func(*os.Root, Object) (string, error)) func(context.Context, Object, ToolEnv, func(string) error) ToolResult {
 	return func(ctx context.Context, args Object, env ToolEnv, _ func(string) error) ToolResult {
 		if err := ctx.Err(); err != nil {
@@ -282,6 +319,8 @@ func fileTool(operation func(*os.Root, Object) (string, error)) func(context.Con
 	}
 }
 
+// number reads a validated numeric argument. JSON decoding preserves
+// numbers as json.Number, while in-process callers can supply Go numbers.
 func number(args Object, name string, fallback float64) float64 {
 	switch value := args[name].(type) {
 	case json.Number:

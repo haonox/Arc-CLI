@@ -20,6 +20,8 @@ import (
 	"github.com/creack/pty"
 )
 
+// testEnvironment isolates tests from the user's provider credentials and
+// workspace state.
 func testEnvironment(t *testing.T) {
 	t.Helper()
 	for _, name := range []string{"ARC_MODEL", "ARC_BASE_URL", "ARC_API_KEY", "DEEPSEEK_API_KEY", "NO_COLOR"} {
@@ -52,6 +54,8 @@ type responseFrames struct {
 	delays map[int]time.Duration
 }
 
+// fakeAPI serves scripted SSE responses locally and exposes the received
+// provider requests for assertions.
 func fakeAPI(t *testing.T, responses ...responseFrames) (*httptest.Server, <-chan map[string]any) {
 	t.Helper()
 	script := make(chan responseFrames, len(responses))
@@ -168,6 +172,7 @@ func TestCLIHelpAndInvalidOptionsDoNotSendRequests(t *testing.T) {
 	}
 }
 
+// TestCLIProcess doubles as the subprocess entry point for the PTY tests.
 func TestCLIProcess(t *testing.T) {
 	if os.Getenv("ARC_TEST_HELPER") != "1" {
 		return
@@ -185,6 +190,8 @@ type testTTY struct {
 	answeredColorProbe bool
 }
 
+// startTTY runs the CLI in a pseudoterminal with a fixed width and collects
+// its output asynchronously.
 func startTTY(t *testing.T, server *httptest.Server, width uint16) *testTTY {
 	t.Helper()
 	testEnvironment(t)
@@ -255,6 +262,7 @@ func (tty *testTTY) waitFor(text string) {
 				tty.t.Fatalf("PTY closed before %q\n%q", text, tty.transcript.String())
 			}
 			tty.transcript.WriteString(chunk)
+			// The PTY has no terminal emulator to answer the startup probes.
 			if !tty.answeredColorProbe && strings.Contains(tty.transcript.String(), "\x1b]11;?") &&
 				strings.Contains(tty.transcript.String(), "\x1b[6n") {
 				tty.answeredColorProbe = true
@@ -274,6 +282,8 @@ func TestPTYStreamingChinesePreservesPrefilledInput(t *testing.T) {
 	tty := startTTY(t, server, 45)
 	tty.send("Start streaming\r")
 	tty.waitFor("流式标题")
+	// Type half of a command before the last chunk to check that the
+	// streamed redraw leaves the input buffer intact.
 	tty.send("/sta")
 	tty.waitFor("保留预先输入的命令。")
 	tty.send("tus\r")

@@ -11,6 +11,7 @@ import (
 	"time"
 )
 
+// sse formats payloads as separate server-sent events for the parser fixtures.
 func sse(frames ...string) string {
 	var stream strings.Builder
 	for _, frame := range frames {

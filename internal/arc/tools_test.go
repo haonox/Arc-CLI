@@ -55,6 +55,8 @@ func TestFileToolsSchemaBoundariesAndPatchRollback(t *testing.T) {
 	if data, _ := os.ReadFile(outside); string(data) != "protected" {
 		t.Fatal("outside file changed")
 	}
+	// Both add targets are initially absent. Committing the parent as a file
+	// makes the child operation fail after earlier changes have been applied.
 	got = execute("apply_patch", Object{"operations": []any{
 		Object{"type": "update", "path": "note", "edits": []any{Object{"old_text": "世界", "new_text": "changed"}}},
 		Object{"type": "add", "path": "collision", "content": "parent"},

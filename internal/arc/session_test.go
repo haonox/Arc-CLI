@@ -23,6 +23,8 @@ func TestLegacySessionCanBranchAndArchive(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		t.Fatal(err)
 	}
+	// Keep a literal legacy fixture so current encoders cannot mask a reader
+	// compatibility regression. Its cursor intentionally splits a tool pair.
 	legacy := strings.ReplaceAll(`{"type":"session","version":1,"id":"0123656789abcdef","cwd":"CWD","created_at":"2026-09-18T00:00:00+00:00"}
 {"type":"message","id":"user0001","parent":null,"message":{"role":"user","content":"原始问题","tool_calls":[],"tool_call_id":null,"name":null,"stop_reason":null,"usage":null,"is_error":false,"reasoning_content":""}}
 {"type":"message","id":"assistant0002","parent":"user0001","message":{"role":"assistant","tool_calls":[{"id":"old-call","name":"write","arguments":{"path":"should-not-exist","content":"never replay"}}],"stop_reason":"tool_use","is_error":false,"reasoning_content":"thinking"}}

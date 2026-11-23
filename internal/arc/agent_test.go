@@ -12,11 +12,14 @@ import (
 
 type step func(context.Context, ModelRequest, func(ModelDelta) error) (ModelReply, error)
 
+// scriptedProvider serves one response per request and saves the requests so
+// tests can inspect the context seen by each successive turn.
 type scriptedProvider struct {
 	steps    []step
 	requests []ModelRequest
 }
 
+// Stream consumes the next response and reports unexpected extra calls.
 func (p *scriptedProvider) Stream(ctx context.Context, request ModelRequest, emit func(ModelDelta) error) (ModelReply, error) {
 	p.requests = append(p.requests, request)
 	if len(p.steps) == 0 {
@@ -38,6 +41,7 @@ func response(text, reason string, calls ...ToolCall) step {
 	}
 }
 
+// testAgent assembles a real agent with a temporary workspace and in-memory history.
 func testAgent(t *testing.T, p Provider, tools []Tool) *Agent {
 	t.Helper()
 	cwd := t.TempDir()
@@ -61,6 +65,8 @@ func TestAgentOrderedToolsAndFollowUp(t *testing.T) {
 	var events []string
 	status, err := agent.Run(t.Context(), "create a note", func(event Event) error {
 		events = append(events, event.Type)
+		// Queue both kinds of input during a tool batch to exercise their
+		// different insertion points.
 		if event.Type == "tool_execution_start" && event.Data["tool_call"].(ToolCall).ID == "a" {
 			agent.Steer("next round")
 			agent.FollowUp("question afterward")
@@ -131,6 +137,7 @@ func TestAgentSavesCompletedToolBeforeObserverError(t *testing.T) {
 	agent := testAgent(t, &scriptedProvider{steps: []step{response("", "tool_use", call)}}, BuiltinTools())
 	uiErr := errors.New("renderer exited")
 	_, err := agent.Run(t.Context(), "write", func(event Event) error {
+		// Fail after the file write to exercise the persistence-before-delivery contract.
 		if event.Type == "tool_execution_end" {
 			return uiErr
 		}
