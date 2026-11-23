@@ -1,4 +1,4 @@
-module github.com/AuroraEchos/Arc-CLI
+module github.com/haonox/Arc-CLI
 
 go 1.25.0
 

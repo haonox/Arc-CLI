@@ -15,7 +15,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/AuroraEchos/Arc-CLI/internal/arc"
+	"github.com/haonox/Arc-CLI/internal/arc"
 	"github.com/charmbracelet/x/term"
 )
 

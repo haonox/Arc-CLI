@@ -15,7 +15,7 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/AuroraEchos/Arc-CLI/internal/arc"
+	"github.com/haonox/Arc-CLI/internal/arc"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/x/ansi"

@@ -6,7 +6,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/AuroraEchos/Arc-CLI/internal/cli"
+	"github.com/haonox/Arc-CLI/internal/cli"
 )
 
 func main() {
