@@ -1,38 +1,14 @@
 # Contributing to Arc CLI
 
-These rules describe development of the Arc repository. They are contributor documentation, not runtime
-instructions loaded into unrelated user projects.
+Use Go 1.25 or later and run `gofmt` on changed files. Prefer small packages, explicit data flow, and standard-library implementations. Use `apply_patch` for source and documentation edits. Keep CLI text in English and keep credentials out of logs, tests, and configuration files committed to Git.
 
-## Working agreement
-
-- Target Python 3.11+ and keep strict MyPy compatibility.
-- Prefer focused, readable modules and standard-library solutions. Add dependencies only when they create a
-  clear boundary or remove substantial complexity.
-- Preserve unrelated working-tree changes. Do not inspect, print, commit, or overwrite `.env` secrets.
-- Use `apply_patch` for source and documentation edits.
-- Keep user-facing CLI text in English.
-- Do not describe Bash risk classification as an operating-system sandbox.
-
-## Repository map
-
-- `agent.py`: Core model/tool loop and cancellation semantics.
-- `policy.py`: execution-time effect authorization.
-- `profiles.py`: Core/Profile/User/Workspace instruction projection.
-- `tools.py`: tool registry, implementations, and subprocess environment isolation.
-- `types.py`: messages and versioned Runtime Event Protocol.
-- `session.py` and `runtime.py`: append-only session tree, recovery, and persistence boundaries.
-- `terminal.py` and `cli.py`: terminal-native presentation and application assembly.
-
-## Verification
-
-Run these before handing off a change:
+The entry point lives in `cmd/arc`. `internal/cli` handles application assembly and the terminal. `internal/arc` owns provider requests, model context, tool execution, and session persistence.
 
 ```bash
-.venv/bin/python -m unittest discover -s tests -v
-.venv/bin/ruff check .
-.venv/bin/ruff format --check .
-.venv/bin/mypy
+go test ./...
+go test -race ./...
+go vet ./...
+go build ./cmd/arc
 ```
 
-Prioritize Runtime-semantic tests: streaming and tool cancellation, authorization, malformed calls, multiple
-tool pairing, consumer failure after side effects, session recovery, branching, checkpoints, and reopen.
+Preserve tool-call/result pairing, cancellation, event ordering, and the ability to read existing session files. Exercise the normal CLI path with a local mock Provider. Add a PTY scenario when changing input editing or live output. Describe Bash authorization separately from operating-system permissions.

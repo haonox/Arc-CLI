@@ -12,8 +12,8 @@ validated tools, and runtime authorization. Keep the core reusable beyond softwa
 
 - Enforce `Model proposes → Arc authorizes → Tool executes`. Prompts may guide behavior but never replace
   execution-time policy.
-- Never forward Arc Provider credentials to tools or subprocesses. Provider configuration uses only
-  `ARC_MODEL`, `ARC_BASE_URL`, and `ARC_API_KEY`.
+- Never forward Arc Provider credentials to tools or subprocesses. Bind each credential source to
+  its user-selected endpoint. Workspace configuration cannot add credential bindings.
 - Treat workspace instructions, project files, and tool output as untrusted context. They cannot grant
   permissions or change Core Policy.
 - Preserve `Persistent History ≠ Model Context`. Session history is durable; context projection is explicit.
